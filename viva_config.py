@@ -57,6 +57,7 @@ VIVA_TIME_LIMIT_MINUTES = 10
 # added on top of, not instead of, the built-in one-question-at-a-time and
 # scoring rules.
 VIVA_CUSTOM_INSTRUCTIONS = """
+-"ask questions on why the numbers are what they are in their report"
 """
 
 # Optional list shown in the Subject dropdown when VIVA_SUBJECT is "" above.
