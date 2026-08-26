@@ -46,6 +46,19 @@ VIVA_TOTAL_QUESTIONS = 5
 # timer entirely (the viva will then only end based on VIVA_TOTAL_QUESTIONS).
 VIVA_TIME_LIMIT_MINUTES = 10
 
+# Optional extra guidance for the examiner AI — use this to steer WHAT kind
+# of questions get asked, without ever touching viva_gen.py. Leave as ""
+# for the default question style. Examples of things you can put here:
+#   - "Only ask questions about Chapters 3 and 4 (Methodology and Findings)."
+#   - "Do not ask any numerical/calculation questions."
+#   - "Every student must be asked to justify their sample size."
+#   - "Focus questions on ethical implications of the recommendations."
+# Keep it short and specific — a few bullet points work best. This text is
+# added on top of, not instead of, the built-in one-question-at-a-time and
+# scoring rules.
+VIVA_CUSTOM_INSTRUCTIONS = """
+"""
+
 # Optional list shown in the Subject dropdown when VIVA_SUBJECT is "" above.
 # Add/remove subjects here as your faculty roster changes.
 AVAILABLE_SUBJECTS = [
