@@ -23,6 +23,7 @@ try:
         VIVA_TOTAL_QUESTIONS,
         VIVA_TIME_LIMIT_MINUTES,
         AVAILABLE_SUBJECTS,
+        VIVA_CUSTOM_INSTRUCTIONS,
     )
 except ImportError:
     VIVA_SUBJECT = "Organizational Behaviour"
@@ -37,6 +38,7 @@ except ImportError:
         "Organizational Behaviour 2",
         "Business Strategy",
     ]
+    VIVA_CUSTOM_INSTRUCTIONS = ""
 # ==============================================================================
 
 import streamlit as st
@@ -561,7 +563,11 @@ if start_btn and not st.session_state.viva_started and uploaded_file and student
 Student name: {student_name}
 Roll No: {student_roll}
 Difficulty level: {difficulty}
-
+{f'''
+ADDITIONAL FACULTY INSTRUCTIONS — follow these when choosing and phrasing
+questions, in addition to (not instead of) the rules below:
+{VIVA_CUSTOM_INSTRUCTIONS.strip()}
+''' if VIVA_CUSTOM_INSTRUCTIONS.strip() else ""}
 The student has submitted the following project. Base ALL your questions ONLY on this project:
 
 --- PROJECT START ---
