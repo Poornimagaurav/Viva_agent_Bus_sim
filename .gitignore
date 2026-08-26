@@ -1,0 +1,17 @@
+# Secrets — never commit real API keys
+.streamlit/secrets.toml
+
+# Generated at runtime — don't commit student score data or the auto-created
+# timer/anti-cheat component folder
+GLIM_Viva_Scores.xlsx
+viva_controller_component/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS/editor cruft
+.DS_Store
+.vscode/
