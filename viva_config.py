@@ -40,11 +40,11 @@ VIVA_SUBJECT = "Buiness Simulation"
 VIVA_DIFFICULTY = "Standard"
 
 # How many student/examiner exchanges happen before the viva auto-completes.
-VIVA_TOTAL_QUESTIONS = 5
+VIVA_TOTAL_QUESTIONS = 8
 
 # Hard time limit for the whole viva, in minutes. Set to 0 to disable the
 # timer entirely (the viva will then only end based on VIVA_TOTAL_QUESTIONS).
-VIVA_TIME_LIMIT_MINUTES = 10
+VIVA_TIME_LIMIT_MINUTES = 15
 
 # Optional extra guidance for the examiner AI — use this to steer WHAT kind
 # of questions get asked, without ever touching viva_gen.py. Leave as ""
