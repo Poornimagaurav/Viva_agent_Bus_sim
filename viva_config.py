@@ -73,7 +73,7 @@ VIVA_CUSTOM_INSTRUCTIONS = """
 # your total question count or there won't be room left for project-
 # specific questions.
 VIVA_MANDATORY_QUESTIONS = [
-    -"What was the ctsr?",
+    -"What was the ctsr?"
     -"what was the change in share price over the 6 rounds?"
 ]
 
