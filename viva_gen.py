@@ -45,7 +45,8 @@ except ImportError:
 
 import streamlit as st
 import streamlit.components.v1 as components
-from groq import Groq
+from google import genai
+from google.genai import types as genai_types
 import fitz
 from docx import Document
 import io
@@ -64,7 +65,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 st.set_page_config(page_title="GLIM Project Viva Examiner", page_icon="🎓")
 st.title("🎓 GLIM Project Viva Examiner")
-st.caption("Powered by Groq + GPT-OSS 120B — 📝 Text-Based Viva Mode")
+st.caption("Powered by Google Gemini (your own free API key) — 📝 Text-Based Viva Mode")
 
 # Save the scoresheet in the SAME folder as this script, regardless of where
 # Streamlit is launched from. This makes it easy to find on disk.
@@ -252,78 +253,130 @@ def render_viva_controller(remaining_seconds):
     )
     return focus_monitor(key="viva_control_instance")
 
-# --- Groq client ---
-client = Groq(api_key=st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY"))
+# --- Gemini model candidates ---
+# Each student brings their OWN free Gemini API key (entered in the sidebar)
+# instead of everyone sharing one faculty-managed key, so one student's
+# usage can no longer rate-limit or block anyone else's viva.
+#
+# Google renames/retires model IDs faster than this file gets updated, and
+# which exact models a given free-tier key can reach isn't something we can
+# verify from here (the same lesson learned the hard way with a Groq model
+# that 404'd despite being listed in Groq's own docs) — so instead of
+# betting on one hardcoded name, we try each of these in order and stick
+# with the first one that actually works for THAT student's key. If every
+# candidate 404s, check https://aistudio.google.com/ while signed into the
+# affected Google account for a model name it can actually reach, and add
+# it to this list.
+GEMINI_MODEL_CANDIDATES = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+]
+
+def _to_gemini_contents(messages):
+    """Converts our internal OpenAI-style [{"role", "content"}, ...] history
+    into Gemini's shape: a separate system_instruction string, plus a
+    contents list of genai_types.Content (role "user" or "model")."""
+    system_instruction = None
+    contents = []
+    for m in messages:
+        if m["role"] == "system":
+            # Only one system message exists in this app; if that ever
+            # changes, later ones would overwrite earlier ones here.
+            system_instruction = m["content"]
+        else:
+            role = "model" if m["role"] == "assistant" else "user"
+            contents.append(genai_types.Content(
+                role=role, parts=[genai_types.Part.from_text(text=m["content"])]
+            ))
+    return system_instruction, contents
 
 def chat_with_llm(messages, max_retries=5):
-    """Calls the Groq API, retrying transient/rate-limit errors with backoff.
-
-    A burst of simultaneous questions from many students sharing ONE Groq
-    API key is one way to trip the rate limit (HTTP 429), but it is not the
-    only one — a brief timeout, a 5xx, or Groq's own shared capacity for a
-    given model being temporarily stretched can all cause the exact same
-    error, even for a single student testing alone. Without retrying, any
-    of that surfaces as a raw traceback and crashes the student's session.
-    Instead we back off and retry a few times, and only give up (with a
-    friendly message, plus the real error for whoever is troubleshooting)
-    if the problem persists.
-
-    Model: "openai/gpt-oss-120b" — confirmed accessible on this account's
-    key (a prior attempt at "llama-3.3-70b-versatile" 404'd as inaccessible,
-    which models a given key can reach varies by account/tier and is only
-    reliably checked via console.groq.com/docs/models or the Playground
-    while logged into the account the key belongs to). Like the 20B model
-    this replaced, it is still a REASONING model that spends extra hidden
-    "thinking" tokens on every reply on top of the growing conversation
-    history and the embedded project text — being a bigger model, its
-    free-tier token-per-minute budget on Groq may be smaller, not larger,
-    than the 20B model's, so this may not by itself reduce "busy"/rate-limit
-    errors (it should read the report and reason about it somewhat more
-    carefully, though, and replies may be a bit slower).
+    """Calls the Gemini API with the CURRENT STUDENT'S OWN key, retrying
+    transient/rate-limit errors with backoff and falling back through
+    GEMINI_MODEL_CANDIDATES on a "model not found" response. Only gives up
+    (with a friendly message, plus the real error for troubleshooting) once
+    every avenue is exhausted.
     """
+    api_key = (st.session_state.get("gemini_api_key") or "").strip()
+    if not api_key:
+        st.error("⚠️ Enter your Gemini API key in the sidebar before starting the viva.")
+        return None
+
+    client = genai.Client(api_key=api_key)
+    system_instruction, contents = _to_gemini_contents(messages)
+    config = genai_types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        max_output_tokens=1024,
+        temperature=0.4,
+    )
+
+    # Once we've found a model THIS key can reach, keep using it for the
+    # rest of the viva instead of re-probing every candidate on every call.
+    models_to_try = (
+        [st.session_state["gemini_working_model"]]
+        if st.session_state.get("gemini_working_model")
+        else GEMINI_MODEL_CANDIDATES
+    )
+
     last_error = None
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=messages,
-                max_tokens=1024,
-                # "low" keeps hidden "thinking" tokens to a minimum on every
-                # call — unlike the resent conversation history (which Groq's
-                # automatic prompt caching can discount and exempt from rate
-                # limits on a cache hit), reasoning tokens are generated fresh
-                # every time and never benefit from that, so this is the
-                # biggest lever for cutting real per-call token cost and
-                # rate-limit pressure. Trade-off: "low" was previously found
-                # to let the model bundle multiple questions into a single
-                # reply more often than "medium" did — watch actual vivas for
-                # that, and bump back to "medium" (or "high") if it recurs.
-                reasoning_effort="low",
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            last_error = e
-            msg = str(e).lower()
-            is_transient = any(tok in msg for tok in
-                                ["429", "rate limit", "rate_limit", "timeout",
-                                 "timed out", "502", "503", "connection"])
-            if is_transient and attempt < max_retries - 1:
-                # Exponential backoff with jitter so multiple students' retries
-                # don't all land on the same instant and re-collide.
-                wait = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(wait)
-                continue
-            break
+    for model_name in models_to_try:
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model=model_name, contents=contents, config=config,
+                )
+                st.session_state.gemini_working_model = model_name
+                return response.text
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+
+                if any(tok in msg for tok in
+                       ["api key not valid", "api_key_invalid", "permission_denied",
+                        "401", "403"]):
+                    st.error(
+                        "⚠️ Your Gemini API key was rejected. Double-check you pasted "
+                        "it correctly, or get a fresh free key at "
+                        "https://aistudio.google.com/apikey."
+                    )
+                    return None
+
+                if any(tok in msg for tok in ["404", "not found", "does not exist"]):
+                    # This model isn't reachable on this key — try the next
+                    # candidate instead of burning retries on a dead end.
+                    break
+
+                is_transient = any(tok in msg for tok in
+                                    ["429", "resource_exhausted", "rate limit", "quota",
+                                     "timeout", "timed out", "502", "503", "unavailable",
+                                     "connection"])
+                if is_transient and attempt < max_retries - 1:
+                    # Exponential backoff with jitter.
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(wait)
+                    continue
+
+                # A non-transient, non-404 error, or retries exhausted on a
+                # transient one: give up rather than silently cycling every
+                # remaining candidate model.
+                st.error(
+                    "⚠️ The examiner AI is temporarily busy or rate-limited. Please "
+                    "wait a few seconds, then submit your answer again — nothing "
+                    "has been lost."
+                )
+                with st.expander("Technical details (for troubleshooting)"):
+                    st.code(str(last_error))
+                return None
 
     st.error(
-        "⚠️ The examiner AI is temporarily busy or rate-limited — this can "
-        "happen even with a single student testing alone, not only under "
-        "heavy load. Please wait a few seconds, then submit your answer "
-        "again — nothing has been lost."
+        "⚠️ None of the expected Gemini models "
+        f"({', '.join(GEMINI_MODEL_CANDIDATES)}) are available on your API key. "
+        "Check https://aistudio.google.com/ while signed into the Google account "
+        "the key belongs to, for a model name it can access."
     )
-    if last_error is not None:
-        with st.expander("Technical details (for troubleshooting)"):
-            st.code(str(last_error))
+    with st.expander("Technical details (for troubleshooting)"):
+        st.code(str(last_error))
     return None
 
 # --- Save to Google Sheets via Webhook ---
@@ -722,6 +775,20 @@ with st.sidebar:
         )
 
     st.divider()
+    st.subheader("🔑 Your Gemini API Key")
+    st.caption(
+        "Each student uses their OWN free key — this keeps your viva from "
+        "ever being slowed down by other students. Get one in under a "
+        "minute at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) "
+        "(sign in with any Google account, click \"Create API key\"). It is "
+        "never saved anywhere — not in the scoresheet, not in Google Sheets."
+    )
+    st.text_input(
+        "Gemini API Key", type="password", placeholder="AIza...",
+        key="gemini_api_key",
+    )
+
+    st.divider()
     st.subheader("📄 Upload Project")
     uploaded_file = st.file_uploader(
         "Upload your project report",
@@ -731,8 +798,11 @@ with st.sidebar:
 
     start_btn = st.button(
         "🎓 Start Viva", type="primary",
-        disabled=(uploaded_file is None or not student_name or not student_roll or already_done)
+        disabled=(uploaded_file is None or not student_name or not student_roll
+                  or already_done or not (st.session_state.get("gemini_api_key") or "").strip())
     )
+    if not st.session_state.get("gemini_api_key", "").strip():
+        st.warning("Enter your Gemini API key to begin.")
     if not student_name:
         st.warning("Enter student name to begin.")
     elif not student_roll:
@@ -759,6 +829,7 @@ for key, default in [
     ("cheated_detected", False),
     ("timeout_triggered", False),
     ("viva_start_time", None),
+    ("gemini_working_model", None),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
