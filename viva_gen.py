@@ -289,6 +289,17 @@ def _to_gemini_contents(messages):
             contents.append(genai_types.Content(
                 role=role, parts=[genai_types.Part.from_text(text=m["content"])]
             ))
+
+    if not contents:
+        # The very first call of a viva has ONLY the system message so far
+        # (the opening greeting hasn't been generated yet) — unlike Groq/
+        # OpenAI-style chat APIs, Gemini rejects an empty `contents` list
+        # outright ("contents are required"), so give it a minimal kickoff
+        # turn. The system prompt already ends with an explicit instruction
+        # to begin by greeting the student, so this just triggers that.
+        contents.append(genai_types.Content(
+            role="user", parts=[genai_types.Part.from_text(text="Begin the viva now.")]
+        ))
     return system_instruction, contents
 
 def chat_with_llm(messages, max_retries=5):
@@ -346,6 +357,24 @@ def chat_with_llm(messages, max_retries=5):
                     # This model isn't reachable on this key — try the next
                     # candidate instead of burning retries on a dead end.
                     break
+
+                if any(tok in msg for tok in
+                       ["400", "invalid_argument", "invalid argument"]):
+                    # A malformed request (e.g. once, an empty `contents`
+                    # list on the very first call). Retrying won't help —
+                    # the exact same request would just fail the exact same
+                    # way — so say so plainly instead of the misleading
+                    # "temporarily busy, try again" message, which would
+                    # send a student into a pointless retry loop.
+                    st.error(
+                        "⚠️ The examiner AI rejected this request as malformed — "
+                        "this points to a bug in the app rather than something "
+                        "retrying will fix. Please tell your faculty, including "
+                        "the technical details below."
+                    )
+                    with st.expander("Technical details (for troubleshooting)"):
+                        st.code(str(last_error))
+                    return None
 
                 is_transient = any(tok in msg for tok in
                                     ["429", "resource_exhausted", "rate limit", "quota",
