@@ -64,7 +64,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 st.set_page_config(page_title="GLIM Project Viva Examiner", page_icon="🎓")
 st.title("🎓 GLIM Project Viva Examiner")
-st.caption("Powered by Groq + Llama 3.3 70B — 📝 Text-Based Viva Mode")
+st.caption("Powered by Groq + GPT-OSS 20B — 📝 Text-Based Viva Mode")
 
 # Save the scoresheet in the SAME folder as this script, regardless of where
 # Streamlit is launched from. This makes it easy to find on disk.
@@ -268,27 +268,31 @@ def chat_with_llm(messages, max_retries=5):
     friendly message, plus the real error for whoever is troubleshooting)
     if the problem persists.
 
-    Model choice: this used to run "openai/gpt-oss-20b", a REASONING model —
-    it silently spends extra hidden "thinking" tokens on every single reply,
-    on top of the growing conversation history and the project text embedded
-    in the system prompt, and Groq's free tier only gives that model 8,000
-    tokens/minute. A single viva session's later turns can burn through that
-    in one or two calls with no other students involved at all, which is
-    exactly the kind of "busy" error a solo tester can hit. "llama-3.3-70b-
-    versatile" is a plain (non-reasoning) model with a 12,000 tokens/minute
-    free-tier budget and no hidden reasoning-token overhead, so the same
-    conversation uses noticeably less of its budget per call — a solid,
-    same-provider way to make this more resilient without adding another
-    API key or provider.
+    Model: "openai/gpt-oss-20b" is a REASONING model — it spends extra
+    hidden "thinking" tokens on every reply, on top of the growing
+    conversation history and the project text embedded in the system
+    prompt, so it can hit a token-budget-based rate limit within a single
+    viva even with no other students involved. A non-reasoning model with a
+    bigger token budget would help, but which models a given Groq API key
+    can actually reach varies by account/tier (a "llama-3.3-70b-versatile"
+    attempt here 404'd as not accessible on this key even though Groq's own
+    docs list it) — check console.groq.com/docs/models or the Playground
+    while logged into the account this key belongs to before changing this,
+    rather than guessing from outside documentation.
     """
     last_error = None
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="openai/gpt-oss-20b",
                 messages=messages,
                 max_tokens=1024,
-                temperature=0.4,
+                # "medium" balances speed with reliably following instructions like
+                # "ask ONE question at a time" — "low" was faster but let the model
+                # bundle multiple questions into a single reply more often. Bump to
+                # "high" for even more careful, deliberate questioning at the cost
+                # of extra latency; drop back to "low" only if replies feel slow.
+                reasoning_effort="medium",
             )
             return response.choices[0].message.content
         except Exception as e:
