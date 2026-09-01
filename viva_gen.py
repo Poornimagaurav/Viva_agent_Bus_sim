@@ -64,7 +64,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 st.set_page_config(page_title="GLIM Project Viva Examiner", page_icon="🎓")
 st.title("🎓 GLIM Project Viva Examiner")
-st.caption("Powered by Groq + GPT-OSS 20B — 🎙️ Web-Enabled Oral Viva Mode")
+st.caption("Powered by Groq + Llama 3.3 70B — 📝 Text-Based Viva Mode")
 
 # Save the scoresheet in the SAME folder as this script, regardless of where
 # Streamlit is launched from. This makes it easy to find on disk.
@@ -255,29 +255,40 @@ def render_viva_controller(remaining_seconds):
 # --- Groq client ---
 client = Groq(api_key=st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY"))
 
-def chat_with_llm(messages, max_retries=4):
+def chat_with_llm(messages, max_retries=5):
     """Calls the Groq API, retrying transient/rate-limit errors with backoff.
 
-    During a live exam, many students share ONE Groq API key, so bursts of
-    simultaneous questions can trip the free-tier rate limit (HTTP 429) or
-    hit a brief timeout/5xx. Without retrying, that surfaces as a raw
-    traceback and crashes the student's session. Instead we back off and
-    retry a few times, and only give up (with a friendly message) if the
-    problem persists.
+    A burst of simultaneous questions from many students sharing ONE Groq
+    API key is one way to trip the rate limit (HTTP 429), but it is not the
+    only one — a brief timeout, a 5xx, or Groq's own shared capacity for a
+    given model being temporarily stretched can all cause the exact same
+    error, even for a single student testing alone. Without retrying, any
+    of that surfaces as a raw traceback and crashes the student's session.
+    Instead we back off and retry a few times, and only give up (with a
+    friendly message, plus the real error for whoever is troubleshooting)
+    if the problem persists.
+
+    Model choice: this used to run "openai/gpt-oss-20b", a REASONING model —
+    it silently spends extra hidden "thinking" tokens on every single reply,
+    on top of the growing conversation history and the project text embedded
+    in the system prompt, and Groq's free tier only gives that model 8,000
+    tokens/minute. A single viva session's later turns can burn through that
+    in one or two calls with no other students involved at all, which is
+    exactly the kind of "busy" error a solo tester can hit. "llama-3.3-70b-
+    versatile" is a plain (non-reasoning) model with a 12,000 tokens/minute
+    free-tier budget and no hidden reasoning-token overhead, so the same
+    conversation uses noticeably less of its budget per call — a solid,
+    same-provider way to make this more resilient without adding another
+    API key or provider.
     """
     last_error = None
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="openai/gpt-oss-20b",
+                model="llama-3.3-70b-versatile",
                 messages=messages,
                 max_tokens=1024,
-                # "medium" balances speed with reliably following instructions like
-                # "ask ONE question at a time" — "low" was faster but let the model
-                # bundle multiple questions into a single reply more often. Bump to
-                # "high" for even more careful, deliberate questioning at the cost
-                # of extra latency; drop back to "low" only if replies feel slow.
-                reasoning_effort="medium",
+                temperature=0.4,
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -295,10 +306,14 @@ def chat_with_llm(messages, max_retries=4):
             break
 
     st.error(
-        "⚠️ The examiner AI is temporarily busy (likely many students using "
-        "the same API key at once). Please wait a few seconds, then submit "
-        "your answer again — nothing has been lost."
+        "⚠️ The examiner AI is temporarily busy or rate-limited — this can "
+        "happen even with a single student testing alone, not only under "
+        "heavy load. Please wait a few seconds, then submit your answer "
+        "again — nothing has been lost."
     )
+    if last_error is not None:
+        with st.expander("Technical details (for troubleshooting)"):
+            st.code(str(last_error))
     return None
 
 # --- Save to Google Sheets via Webhook ---
