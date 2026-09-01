@@ -304,19 +304,31 @@ def chat_with_llm(messages, max_retries=4):
 # --- Save to Google Sheets via Webhook ---
 def save_to_google_sheets(student_name, student_roll, student_email, subject, difficulty, score,
                           grade, strengths, improvements, exchanges, project_name):
+    """Posts one row to the Google Sheet webhook. Returns (success, message)
+    instead of calling st.error/st.warning directly — those calls only ever
+    render on the ONE script rerun where this function happens to execute;
+    on every later rerun of the same "viva ended" screen, Streamlit doesn't
+    replay them, so a real error can flash for a moment and then vanish
+    before anyone reads it. The caller stores the returned message in
+    st.session_state and re-displays it on every rerun instead, so a
+    misconfiguration is actually visible rather than silently disappearing.
+    """
     webhook_url = st.secrets.get("GSHEETS_WEBHOOK_URL") or os.environ.get("GSHEETS_WEBHOOK_URL")
     if not webhook_url:
-        st.error("Google Sheets NOT saved: the GSHEETS_WEBHOOK_URL secret is missing or empty. "
-                 "In Streamlit -> Settings -> Secrets add a line exactly like:  "
-                 'GSHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/XXX/exec"  '
-                 "then Save and Reboot.")
-        return False
+        return False, (
+            "Google Sheets NOT saved: the GSHEETS_WEBHOOK_URL secret is missing or empty. "
+            "In Streamlit -> Settings -> Secrets add a line exactly like:  "
+            'GSHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/XXX/exec"  '
+            "then Save and Reboot."
+        )
     if not str(webhook_url).strip().endswith("/exec"):
-        st.warning("Your GSHEETS_WEBHOOK_URL does not end in /exec. Use the Apps Script Web App "
-                   "URL from Deploy -> Web app, not the editor or /dev URL.")
-        
+        return False, (
+            "Your GSHEETS_WEBHOOK_URL does not end in /exec. Use the Apps Script Web App "
+            "URL from Deploy -> Web app, not the editor or /dev URL."
+        )
+
     payload = {
-        "student_email": student_email,
+        "student_name": student_name,
         "student_roll": student_roll,
         "student_email": student_email,
         "subject": subject,
@@ -328,21 +340,21 @@ def save_to_google_sheets(student_name, student_roll, student_email, subject, di
         "strengths": strengths,
         "improvements": improvements
     }
-    
+
     try:
         response = requests.post(webhook_url, json=payload, timeout=15)
         if response.status_code == 200 and "Success" in response.text:
-            return True
+            return True, "📊 Score successfully posted to Google Sheets!"
         else:
-            st.warning("Google Sheets did not accept the data (HTTP "
-                       + str(response.status_code) + "). Response start: "
-                       + str(response.text)[:300]
-                       + "  ->  Most likely the Apps Script Web App access is not set to "
-                       "'Anyone', or you edited the script without deploying a NEW version.")
-            return False
+            return False, (
+                "Google Sheets did not accept the data (HTTP "
+                + str(response.status_code) + "). Response start: "
+                + str(response.text)[:300]
+                + "  ->  Most likely the Apps Script Web App access is not set to "
+                "'Anyone', or you edited the script without deploying a NEW version."
+            )
     except Exception as e:
-        st.error(f"⚠️ Failed to write to Google Sheets: {e}")
-        return False
+        return False, f"⚠️ Failed to write to Google Sheets: {e}"
 
 # --- Extract text from uploaded file ---
 def extract_text(uploaded_file):
@@ -793,7 +805,7 @@ Your rules:
 - Keep responses concise — this is a spoken oral viva.
 - Focus on the following two-phase examination flow:
 
-  PHASE 1: CONCEPT AUTHENTICATION (First 2-3 questions)
+  PHASE 1: CONCEPT AUTHENTICATION (First 2 questions)
   Your FIRST job is to authenticate the student: confirm they genuinely know the
   concepts, theories, models, frameworks and terminology that appear in THEIR OWN
   report. Identify the key concepts actually named in the project text above and
@@ -803,19 +815,33 @@ Your rules:
   - On a LATER turn, ask how that specific concept was applied in their project
     and why they chose it — as its own separate question, not combined with the
     definition question.
-  - Across several separate turns (not one combined message), require the student
-    to correctly explain at least TWO key concepts from their report before you
-    move on to Phase 2.
+  - Across several separate turns (not one combined message), cover AT LEAST TWO
+    DIFFERENT concepts from their report before you move on to Phase 2. "Cover"
+    means you asked about it — it does NOT mean the student has to answer it
+    correctly before you're allowed to move on (see the strict repeat limit
+    below for why).
+  - STRICT LIMIT ON REPEATS — this matters as much as the one-question rule:
+    if a student's answer on a concept is wrong, vague, or garbled, you may
+    ask AT MOST ONE follow-up attempt on that SAME concept (e.g. a simpler
+    rephrasing, or narrowing to just one part of it). If that second attempt
+    is STILL unsatisfactory, do NOT ask about that concept again in any form
+    — never a third rephrasing. Silently note the gap for your final
+    assessment, weight the score down for it, and move on to a genuinely
+    DIFFERENT concept or straight to Phase 2. Two total attempts per concept
+    is the hard ceiling, no exceptions, even if the student's answer still
+    seems weak — the viva must keep moving forward.
   - If the student cannot define or explain the core concepts written in their own
-    report, treat this as a red flag for authenticity, note it explicitly, weight
-    the final score down accordingly, and continue with stricter questioning.
+    report even after that one retry, treat this as a red flag for authenticity,
+    note it explicitly, and weight the final score down accordingly — but do
+    this by moving on and reflecting it in your assessment, not by dwelling on
+    the same concept further.
 
   PHASE 2: PROJECT DEEP DIVE (Remaining questions)
   Once the concept authentication is done, probe their specific methodology, findings, data collection, and recommendations. 
   - Challenge weak arguments, assumptions, or inconsistencies in their data.
   - Check their knowledge of their own analysis.
 
-- After every 5 exchanges give a brief mid-viva remark (one or two sentences),
+- After every 4 exchanges give a brief mid-viva remark (one or two sentences),
   then still ask only ONE question in that same reply — the remark does not
   give you license to ask more than one question.
 - After {VIVA_TOTAL_QUESTIONS} exchanges, end the viva with EXACTLY this format:
@@ -1009,8 +1035,10 @@ if st.session_state.viva_ended:
         except Exception as e:
             st.error(f"⚠️ Local auto-save failed: {e}")
 
-        # Post to Google Sheets if webhook is configured
-        gs_saved = save_to_google_sheets(
+        # Post to Google Sheets if webhook is configured. The result is
+        # stored (not just shown once) so it's still visible on every later
+        # rerun of this screen — see the persistent display block below.
+        gs_success, gs_message = save_to_google_sheets(
             student_name=student_name,
             student_roll=student_roll,
             student_email=student_email,
@@ -1023,8 +1051,15 @@ if st.session_state.viva_ended:
             exchanges=st.session_state.exchange_count,
             project_name=st.session_state.project_name,
         )
-        if gs_saved:
-            st.success("📊 Score successfully posted to Google Sheets!")
+        st.session_state.gs_save_result = (gs_success, gs_message)
+
+    # ---- Persistent Google Sheets status (survives later reruns) ----
+    if st.session_state.get("gs_save_result"):
+        gs_success, gs_message = st.session_state.gs_save_result
+        if gs_success:
+            st.success(gs_message)
+        else:
+            st.error(gs_message)
 
     # ---- Score / grade display ----
     col1, col2 = st.columns(2)
@@ -1065,7 +1100,7 @@ if st.session_state.viva_ended:
             st.success(f"✅ Updated and saved to `{filepath}`")
 
             # Post manual override to Google Sheets
-            save_to_google_sheets(
+            gs_success, gs_message = save_to_google_sheets(
                 student_name=student_name,
                 student_roll=student_roll,
                 student_email=student_email,
@@ -1078,6 +1113,7 @@ if st.session_state.viva_ended:
                 exchanges=st.session_state.exchange_count,
                 project_name=st.session_state.project_name,
             )
+            st.session_state.gs_save_result = (gs_success, gs_message)
             st.rerun()
 
     # ---- Download button kept as a BACKUP per your request ----
