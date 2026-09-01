@@ -60,6 +60,23 @@ VIVA_CUSTOM_INSTRUCTIONS = """
 -"ask questions on why the numbers are what they are in their report"
 """
 
+# Optional list of SPECIFIC, exact-wording questions for this subject that
+# every student must be asked at some point during their viva — use this
+# when you have a fixed set of questions you want covered (a theory
+# question bank, standard concept checks, etc.), as opposed to
+# VIVA_CUSTOM_INSTRUCTIONS above which is general steering/guidance rather
+# than exact question text. Leave as [] (empty list) if you don't need
+# this. The examiner will weave these in one at a time alongside its own
+# project-specific questions, not all back-to-back, and may phrase them
+# slightly more naturally while keeping their meaning — they still count
+# toward VIVA_TOTAL_QUESTIONS above, so don't list more than roughly half
+# your total question count or there won't be room left for project-
+# specific questions.
+VIVA_MANDATORY_QUESTIONS = [
+    # "What was the ctsr?
+    # "what was the change in share price over the 6 rounds?",
+]
+
 # Optional list shown in the Subject dropdown when VIVA_SUBJECT is "" above.
 # Add/remove subjects here as your faculty roster changes.
 AVAILABLE_SUBJECTS = [
