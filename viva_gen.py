@@ -964,6 +964,36 @@ def request_final_summary():
     st.session_state.messages.append({"role": "assistant", "content": summary})
     return summary
 
+# --- Narrow follow-up used ONLY when a closing message already contained
+#     "VIVA COMPLETE" but no parseable numeric score (a malformed or missing
+#     Score line) — asks for nothing but the number, one more time, before
+#     falling back to the manual-entry UI. Returns a float or None. ---
+def request_score_only():
+    nudge = (
+        f"Your previous message was missing a valid numeric score. Reply with "
+        f"ONLY one line and nothing else — no words, no explanation, no "
+        f"repeated assessment:\n\nScore: X/{VIVA_MAX_SCORE}\n\nReplace X with your "
+        f"real numeric mark for this student, from 0 to {VIVA_MAX_SCORE} "
+        f"(whole or half-point, e.g. 'Score: 11/{VIVA_MAX_SCORE}')."
+    )
+    st.session_state.messages.append({"role": "user", "content": nudge})
+    reply = chat_with_llm(st.session_state.messages)
+    if reply is None:
+        st.session_state.messages.pop()
+        return None
+    st.session_state.messages.append({"role": "assistant", "content": reply})
+    return parse_score(reply)
+
+def resolve_final_score(final_text):
+    """Parse the score out of the closing message, and if that fails, make
+    ONE narrow follow-up attempt asking the model for just the number before
+    giving up (the manual-entry UI is still the ultimate fallback)."""
+    score = parse_score(final_text)
+    if score is None:
+        with st.spinner("Score was missing — asking the examiner once more..."):
+            score = request_score_only()
+    return score
+
 # --- Handle student response ---
 def handle_response(user_text):
     st.session_state.messages.append({"role": "user", "content": user_text})
@@ -997,7 +1027,7 @@ def handle_response(user_text):
                 st.markdown(final_text)
 
         st.session_state.viva_ended = True
-        st.session_state.final_score = parse_score(final_text)
+        st.session_state.final_score = resolve_final_score(final_text)
         st.session_state.final_grade = get_grade(st.session_state.final_score)
         st.session_state.closing_message = final_text
 
@@ -1017,7 +1047,7 @@ if st.session_state.viva_ended:
     elif st.session_state.get("timeout_triggered", False) and not st.session_state.score_saved:
         with st.spinner("⏳ Time's up! Generating final assessment..."):
             final_text = request_final_summary()
-        st.session_state.final_score = parse_score(final_text)
+        st.session_state.final_score = resolve_final_score(final_text)
         st.session_state.final_grade = get_grade(st.session_state.final_score)
         st.session_state.closing_message = final_text
 
