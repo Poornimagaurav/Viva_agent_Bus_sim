@@ -375,34 +375,39 @@ def truncate(text, max_chars=6000):
         return text[:max_chars] + "\n\n[... project continues ...]"
     return text
 
+# --- Scoring scale (top-level constant so it's the ONE place to change the
+#     scale if it's ever adjusted again) ---
+VIVA_MAX_SCORE = 15
+
 # --- Parse score from closing message ---
 def parse_score(text):
-    """Try a series of regex patterns to pull a 0-10 score out of the LLM reply.
-    The patterns are tried in order — most specific first."""
+    """Try a series of regex patterns to pull a 0-VIVA_MAX_SCORE score out of
+    the LLM reply. The patterns are tried in order — most specific first."""
     if not text:
         return None
     # Strip markdown emphasis (*, **) so they don't trip up the regex
     cleaned = re.sub(r'[\*_`]', '', text)
 
+    m = VIVA_MAX_SCORE
     patterns = [
-        # "Score: 7/10" or "Score - 7.5 / 10"
-        r'score\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*/\s*10',
-        # "Final score: 7" or "Overall score 7.5"
+        # "Score: 11/15" or "Score - 11.5 / 15"
+        rf'score\s*[:\-]?\s*(\d+(?:\.\d+)?)\s*/\s*{m}',
+        # "Final score: 11" or "Overall score 11.5"
         r'(?:final|overall)?\s*score\s*[:\-]?\s*(\d+(?:\.\d+)?)\b',
-        # "7/10" or "7.5 / 10" anywhere in the text
-        r'\b(\d+(?:\.\d+)?)\s*/\s*10\b',
-        # "7 out of 10"
-        r'\b(\d+(?:\.\d+)?)\s+out\s+of\s+10\b',
-        # "I would give this an 8"
-        r'(?:give|rate|award)\s+(?:this|you|the\s+student)?\s*(?:an?\s+)?(\d+(?:\.\d+)?)\s*(?:/\s*10)?',
+        # "11/15" or "11.5 / 15" anywhere in the text
+        rf'\b(\d+(?:\.\d+)?)\s*/\s*{m}\b',
+        # "11 out of 15"
+        rf'\b(\d+(?:\.\d+)?)\s+out\s+of\s+{m}\b',
+        # "I would give this an 11"
+        rf'(?:give|rate|award)\s+(?:this|you|the\s+student)?\s*(?:an?\s+)?(\d+(?:\.\d+)?)\s*(?:/\s*{m})?',
     ]
     for pattern in patterns:
         match = re.search(pattern, cleaned, re.IGNORECASE)
         if match:
             try:
                 value = float(match.group(1))
-                # sanity check: must be a plausible 0-10 mark
-                if 0 <= value <= 10:
+                # sanity check: must be a plausible 0-VIVA_MAX_SCORE mark
+                if 0 <= value <= VIVA_MAX_SCORE:
                     return value
             except ValueError:
                 continue
@@ -425,7 +430,14 @@ def parse_feedback(text):
 
 # --- Save to Excel ---
 def save_to_excel(student_name, student_roll, student_email, subject, difficulty, score,
-                  grade, strengths, improvements, exchanges, project_name):
+                  grade, strengths, improvements, exchanges, project_name, row_num=None):
+    """Write one student's result to the local scoresheet.
+
+    row_num=None (the normal case) appends a new row and returns
+    (filepath, the_row_number_written). Pass that returned row number back
+    in as row_num on a later call (e.g. when a manual score override
+    re-saves the same student) to overwrite that same row in place instead
+    of appending a second, duplicate row for the same viva."""
 
     thin = Side(style='thin')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
@@ -436,19 +448,19 @@ def save_to_excel(student_name, student_roll, student_email, subject, difficulty
 
     if score is None:
         score_fill = PatternFill('solid', start_color='D9D9D9')
-    elif score >= 8:
+    elif score >= 12:   # 8/10 equivalent
         score_fill = PatternFill('solid', start_color='C6EFCE')
-    elif score >= 6:
+    elif score >= 9:    # 6/10 equivalent
         score_fill = PatternFill('solid', start_color='FFEB9C')
     else:
         score_fill = PatternFill('solid', start_color='FFC7CE')
 
     with FileLock(SCORESHEET_LOCK, timeout=30):
-        _write_excel_row(student_name, student_roll, student_email, subject, difficulty, score, grade,
+        written_row = _write_excel_row(student_name, student_roll, student_email, subject, difficulty, score, grade,
                           strengths, improvements, exchanges, project_name,
                           thin, border, header_font, header_fill, center,
-                          left, score_fill)
-    return SCORESHEET_FILE
+                          left, score_fill, row_num=row_num)
+    return SCORESHEET_FILE, written_row
 
 def _ensure_column(ws, position, header, header_font, header_fill, center, border, width):
     """Insert `header` as a new column at `position` if a sheet saved before
@@ -467,8 +479,9 @@ def _ensure_column(ws, position, header, header_font, header_fill, center, borde
 def _write_excel_row(student_name, student_roll, student_email, subject, difficulty, score, grade,
                       strengths, improvements, exchanges, project_name,
                       thin, border, header_font, header_fill, center,
-                      left, score_fill):
-    """The actual read-modify-write, called only while SCORESHEET_LOCK is held."""
+                      left, score_fill, row_num=None):
+    """The actual read-modify-write, called only while SCORESHEET_LOCK is held.
+    Returns the row number written to."""
     if os.path.exists(SCORESHEET_FILE):
         wb = load_workbook(SCORESHEET_FILE)
         ws = wb.active
@@ -479,22 +492,32 @@ def _write_excel_row(student_name, student_roll, student_email, subject, difficu
         _ensure_column(ws, 4, "Roll No", header_font, header_fill, center, border, 16)
         _ensure_column(ws, 5, "Email", header_font, header_fill, center, border, 26)
 
-        # A previous save appends a "Total Students" summary row a couple of
-        # rows below the last student. Remove it before appending the next
-        # student, otherwise every save leaves another stale summary row
-        # scattered through the data instead of one at the bottom.
+        # A previous save appends a "Total Students" summary block a couple of
+        # rows below the last student. Always strip it before writing (both
+        # on a plain append AND on an in-place overwrite below) so we never
+        # leave a stale summary row scattered through the data, and so the
+        # summary gets freshly recomputed against the current last row.
         for r in range(ws.max_row, 1, -1):
             if ws.cell(row=r, column=1).value == "Total Students":
                 ws.delete_rows(r, ws.max_row - r + 1)
                 break
-        next_row = ws.max_row + 1
+
+        # row_num set (and pointing at a real data row for this same student)
+        # means this is a re-save of an already-written row — e.g. applying a
+        # manual score after the examiner failed to return one — so overwrite
+        # that row in place instead of appending a duplicate one below it.
+        if (row_num is not None and 2 <= row_num <= ws.max_row
+                and str(ws.cell(row=row_num, column=4).value or "").strip() == str(student_roll or "").strip()):
+            next_row = row_num
+        else:
+            next_row = ws.max_row + 1
     else:
         wb = Workbook()
         ws = wb.active
         ws.title = "Viva Scores"
 
         headers = ["S.No", "Date", "Student Name", "Roll No", "Email", "Subject",
-                   "Difficulty", "Project File", "Score (/10)",
+                   "Difficulty", "Project File", "Score (/15)",
                    "Grade", "Exchanges", "Strengths", "Areas for Improvement"]
         col_widths = [6, 18, 20, 16, 26, 22, 12, 28, 12, 20, 10, 40, 40]
 
@@ -539,13 +562,16 @@ def _write_excel_row(student_name, student_roll, student_email, subject, difficu
 
     ws.row_dimensions[next_row].height = 40
 
-    # Summary row
-    summary_row = ws.max_row + 2
+    # Summary row — placed after the true last data row, which is normally
+    # next_row but could be a later row if an in-place overwrite targeted a
+    # row above the current last one.
+    last_data_row = max(next_row, ws.max_row)
+    summary_row = last_data_row + 2
     for col, (label, formula) in enumerate([
-        ("Total Students", f'=COUNTA(C2:C{next_row})'),
-        ("Avg Score", f'=IFERROR(AVERAGEIF(I2:I{next_row},"<>Pending",I2:I{next_row}),"-")'),
-        ("Highest", f'=IFERROR(MAX(I2:I{next_row}),"-")'),
-        ("Lowest", f'=IFERROR(MINIFS(I2:I{next_row},I2:I{next_row},"<>Pending"),"-")')
+        ("Total Students", f'=COUNTA(C2:C{last_data_row})'),
+        ("Avg Score", f'=IFERROR(AVERAGEIF(I2:I{last_data_row},"<>Pending",I2:I{last_data_row}),"-")'),
+        ("Highest", f'=IFERROR(MAX(I2:I{last_data_row}),"-")'),
+        ("Lowest", f'=IFERROR(MINIFS(I2:I{last_data_row},I2:I{last_data_row},"<>Pending"),"-")')
     ], start=1):
         label_cell = ws.cell(row=summary_row, column=col*2-1, value=label)
         label_cell.font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
@@ -557,7 +583,7 @@ def _write_excel_row(student_name, student_roll, student_email, subject, difficu
         val_cell.alignment = center
 
     wb.save(SCORESHEET_FILE)
-    return SCORESHEET_FILE
+    return next_row
 
 # --- Prevent a student from re-attempting the viva with the same link ---
 def get_local_completed_rolls():
@@ -619,18 +645,20 @@ def get_completed_rolls():
     return get_local_completed_rolls() | get_remote_completed_rolls()
 
 # --- Grade helper ---
+# Thresholds are the old /10 cutoffs (9, 8, 7, 6, 5) scaled up by 1.5x to the
+# /15 scale, so the same proportion of the scale earns each grade as before.
 def get_grade(score):
     if score is None:
         return "N/A"
-    elif score >= 9:
+    elif score >= 13.5:
         return "O (Outstanding)"
-    elif score >= 8:
+    elif score >= 12:
         return "A+ (Excellent)"
-    elif score >= 7:
+    elif score >= 10.5:
         return "A (Very Good)"
-    elif score >= 6:
+    elif score >= 9:
         return "B (Good)"
-    elif score >= 5:
+    elif score >= 7.5:
         return "C (Average)"
     else:
         return "F (Fail)"
@@ -669,17 +697,6 @@ with st.sidebar:
         )
 
     st.divider()
-    st.subheader("🔊 Voice Settings")
-    voice_output = st.toggle("🔊 Examiner speaks aloud", value=True,
-                             help="Examiner's questions will be read out loud via the browser text-to-speech API")
-    voice_input = st.toggle("🎙️ Use microphone for answers", value=True,
-                            help="Speak your answers using your device's microphone")
-    if voice_output or voice_input:
-        st.success("🎤 Oral viva mode is ON")
-    else:
-        st.info("📝 Text-only mode")
-
-    st.divider()
     st.subheader("📄 Upload Project")
     uploaded_file = st.file_uploader(
         "Upload your project report",
@@ -709,13 +726,11 @@ for key, default in [
     ("viva_ended", False),
     ("score_saved", False),
     ("final_score", None),
+    ("excel_row_num", None),
     ("final_grade", ""),
     ("project_name", ""),
-    ("listening", False),
     ("closing_message", ""),
     ("saved_path", ""),
-    ("processed_audio_ids", set()),
-    ("last_spoken_index", -1),
     ("cheated_detected", False),
     ("timeout_triggered", False),
     ("viva_start_time", None),
@@ -849,6 +864,21 @@ Your rules:
   - Challenge weak arguments, assumptions, or inconsistencies in their data.
   - Check their knowledge of their own analysis.
 
+- NEVER REPEAT A QUESTION, AT ANY POINT IN THE VIVA — this rule applies to
+  the ENTIRE conversation so far, not just your last few turns. Before you
+  write your next question, scroll back through EVERY question you have
+  already asked in this conversation (Phase 1 and Phase 2 alike, including
+  ones from many exchanges ago) and confirm your new question is not the
+  same one, and not just a reworded version of the same fact or figure you
+  already asked about. This check matters MOST in the final couple of
+  exchanges, when it is tempting to reach back to something asked earlier
+  simply because fresh material feels scarce — do not do this. If you
+  genuinely cannot find a new angle on the project itself, ask about a
+  smaller sub-point you have not yet touched (a specific number, a specific
+  sentence, a specific chart or table in the report, an implication of an
+  answer they already gave), or pose a hypothetical/what-if variation on the
+  project — but never ask something you have already asked, word-for-word
+  or in substance, in this same viva.
 - After every 5 exchanges give a brief mid-viva remark (one or two sentences),
   then still ask only ONE question in that same reply — the remark does not
   give you license to ask more than one question.
@@ -857,15 +887,24 @@ Your rules:
   you feel you've "covered enough." Reaching {VIVA_TOTAL_QUESTIONS} exchanges
   is a hard floor, not a suggestion — if you run out of fresh Phase 2 angles,
   find another distinct one (a different section, metric, or assumption in
-  the report) rather than wrapping up early. Ending before
-  {VIVA_TOTAL_QUESTIONS} questions is a failure to follow this prompt.
+  the report) rather than wrapping up early or reusing an earlier question.
+  Ending before {VIVA_TOTAL_QUESTIONS} questions is a failure to follow this
+  prompt, and so is repeating a question to fill time.
 - After {VIVA_TOTAL_QUESTIONS} exchanges (not before), end the viva with EXACTLY this format:
 
 VIVA COMPLETE
-Score: X/10
+Score: X/{VIVA_MAX_SCORE}
 Strengths: [2-3 specific points]
 Areas for Improvement: [2-3 specific points]
 Recommended Topics: [list]
+
+The "Score: X/{VIVA_MAX_SCORE}" line is MANDATORY and must contain an actual
+number, not the literal letter X — replace X with your real numeric mark
+from 0 to {VIVA_MAX_SCORE} (whole or half-point, e.g. "Score: 11/{VIVA_MAX_SCORE}"
+or "Score: 11.5/{VIVA_MAX_SCORE}"). Never omit this line, never leave it as
+a word or a range instead of one number, and never put the score anywhere
+else in the message — it must appear on its own "Score: " line in exactly
+this closing block.
 
 Begin now by greeting {student_name} warmly and starting Phase 1 (Concept Authentication) by asking your first question about a key concept in their project report."""
 
@@ -905,10 +944,15 @@ def request_final_summary():
         "The viva is now complete. Please immediately produce the final assessment "
         "in EXACTLY this format, with no preamble or follow-up questions:\n\n"
         "VIVA COMPLETE\n"
-        "Score: X/10  (use a number from 0 to 10)\n"
+        f"Score: X/{VIVA_MAX_SCORE}\n"
         "Strengths: [2-3 specific points based on the student's actual answers]\n"
         "Areas for Improvement: [2-3 specific points]\n"
-        "Recommended Topics: [list]"
+        "Recommended Topics: [list]\n\n"
+        f"The 'Score: X/{VIVA_MAX_SCORE}' line is MANDATORY — replace X with an actual "
+        f"number from 0 to {VIVA_MAX_SCORE} (whole or half-point, e.g. "
+        f"'Score: 11/{VIVA_MAX_SCORE}' or 'Score: 11.5/{VIVA_MAX_SCORE}'). Do not leave X "
+        "as a literal letter, a word, or a range — it must be one specific "
+        "number, on its own line."
     )
     st.session_state.messages.append({"role": "user", "content": closing_user_turn})
     summary = chat_with_llm(st.session_state.messages)
@@ -921,12 +965,12 @@ def request_final_summary():
     return summary
 
 # --- Handle student response ---
-def handle_response(user_text, via_voice=False):
+def handle_response(user_text):
     st.session_state.messages.append({"role": "user", "content": user_text})
     st.session_state.exchange_count += 1
 
     with st.chat_message("user"):
-        st.markdown(f"🎙️ *{user_text}*" if via_voice else user_text)
+        st.markdown(user_text)
 
     with st.chat_message("assistant"):
         with st.spinner("Examiner is responding..."):
@@ -957,42 +1001,11 @@ def handle_response(user_text, via_voice=False):
         st.session_state.final_grade = get_grade(st.session_state.final_score)
         st.session_state.closing_message = final_text
 
-# --- Input area (voice + text) ---
+# --- Input area (text only) ---
 if st.session_state.viva_started and not st.session_state.viva_ended:
-    # Visible status banner so user always sees whether voice is active
-    if voice_input or voice_output:
-        bits = []
-        if voice_output:
-            bits.append("🔊 examiner speaks")
-        if voice_input:
-            bits.append("🎙️ browser mic enabled")
-        st.caption("Voice mode: " + " · ".join(bits))
-
-    # Browser microphone input using Streamlit 1.39+ st.audio_input
-    if voice_input:
-        audio_file = st.audio_input("🎙️ Record your answer", key="viva_audio")
-        if audio_file is not None:
-            file_id = getattr(audio_file, "id", None) or hash(audio_file.getvalue())
-            if file_id not in st.session_state.processed_audio_ids:
-                st.session_state.processed_audio_ids.add(file_id)
-                with st.spinner("🎙️ Transcribing speech..."):
-                    try:
-                        transcription = client.audio.transcriptions.create(
-                            file=(audio_file.name, audio_file.getvalue()),
-                            model="whisper-large-v3",
-                        )
-                        spoken_text = transcription.text.strip()
-                        if spoken_text:
-                            handle_response(spoken_text, via_voice=True)
-                        else:
-                            st.warning("Could not transcribe any speech. Please try speaking again.")
-                    except Exception as e:
-                        st.error(f"Groq Whisper transcription failed: {e}")
-
-    # Text input fallback (always visible)
-    typed = st.chat_input("Or type your answer here...")
+    typed = st.chat_input("Type your answer here...")
     if typed:
-        handle_response(typed, via_voice=False)
+        handle_response(typed)
 
 # --- Handle termination cases ---
 if st.session_state.viva_ended:
@@ -1031,7 +1044,7 @@ if st.session_state.viva_ended:
             improvements = "Switched tabs or minimized browser tab during active exam"
             
         try:
-            filepath = save_to_excel(
+            filepath, excel_row = save_to_excel(
                 student_name=student_name,
                 student_roll=student_roll,
                 student_email=student_email,
@@ -1046,6 +1059,9 @@ if st.session_state.viva_ended:
             )
             st.session_state.score_saved = True
             st.session_state.saved_path = filepath
+            # Remembered so a later manual score override (see below) updates
+            # this same row instead of appending a duplicate one.
+            st.session_state.excel_row_num = excel_row
             st.success(f"✅ Scoresheet auto-saved locally to:\n`{filepath}`")
         except Exception as e:
             st.error(f"⚠️ Local auto-save failed: {e}")
@@ -1080,7 +1096,7 @@ if st.session_state.viva_ended:
     col1, col2 = st.columns(2)
     with col1:
         if st.session_state.final_score is not None:
-            st.metric("Final Score", f"{st.session_state.final_score}/10")
+            st.metric("Final Score", f"{st.session_state.final_score}/{VIVA_MAX_SCORE}")
         else:
             st.metric("Final Score", "—")
     with col2:
@@ -1090,8 +1106,8 @@ if st.session_state.viva_ended:
     if st.session_state.final_score is None:
         st.warning("The examiner did not return a numeric score. You can set one manually below.")
         manual = st.number_input(
-            "Manual final score (0-10)", min_value=0.0, max_value=10.0,
-            step=0.5, value=7.0, key="manual_score"
+            f"Manual final score (0-{VIVA_MAX_SCORE})", min_value=0.0, max_value=float(VIVA_MAX_SCORE),
+            step=0.5, value=float(VIVA_MAX_SCORE) / 2, key="manual_score"
         )
         if st.button("Apply manual score and re-save"):
             st.session_state.final_score = float(manual)
@@ -1103,15 +1119,19 @@ if st.session_state.viva_ended:
                 strengths = "N/A - Terminated for cheating"
                 improvements = "Switched tabs or minimized browser tab during active exam"
                 
-            filepath = save_to_excel(
+            filepath, excel_row = save_to_excel(
                 student_name=student_name, student_roll=student_roll, student_email=student_email,
                 subject=subject, difficulty=difficulty,
                 score=st.session_state.final_score, grade=st.session_state.final_grade,
                 strengths=strengths, improvements=improvements,
                 exchanges=st.session_state.exchange_count,
                 project_name=st.session_state.project_name,
+                # Overwrite the "Pending" row the auto-save already wrote,
+                # instead of appending a second row for the same student.
+                row_num=st.session_state.get("excel_row_num"),
             )
             st.session_state.saved_path = filepath
+            st.session_state.excel_row_num = excel_row
             st.success(f"✅ Updated and saved to `{filepath}`")
 
             # Post manual override to Google Sheets
@@ -1144,43 +1164,3 @@ if st.session_state.viva_ended:
 
 elif not st.session_state.viva_started:
     st.info("👈 Fill in settings and upload project to begin.")
-
-# --- Browser Text-to-Speech (TTS) Trigger ---
-if st.session_state.viva_started and voice_output:
-    # Get all assistant messages
-    assistant_msgs = [msg for msg in st.session_state.messages if msg["role"] == "assistant"]
-    if assistant_msgs:
-        last_msg = assistant_msgs[-1]
-        last_msg_index = len(assistant_msgs) - 1
-        
-        # Only speak if it hasn't been spoken yet
-        if st.session_state.get("last_spoken_index", -1) != last_msg_index:
-            st.session_state.last_spoken_index = last_msg_index
-            text_to_speak = last_msg["content"]
-            
-            # If the viva has ended or it contains completion tags, say a short wrap up
-            if st.session_state.viva_ended or "VIVA COMPLETE" in text_to_speak:
-                text_to_speak = "The viva is now complete. I have generated your final score and assessment details. Thank you."
-                
-            # Clean up text for JavaScript
-            escaped_text = (
-                text_to_speak
-                .replace('\\', '\\\\')
-                .replace('"', '\\"')
-                .replace("'", "\\'")
-                .replace('\n', ' ')
-            )
-            
-            html_code = f"""
-            <script>
-            if (window.speechSynthesis) {{
-                window.speechSynthesis.cancel();
-                setTimeout(function() {{
-                    var utterance = new SpeechSynthesisUtterance("{escaped_text}");
-                    utterance.rate = 1.05;
-                    window.speechSynthesis.speak(utterance);
-                }}, 50);
-            }}
-            </script>
-            """
-            components.html(html_code, height=0)
