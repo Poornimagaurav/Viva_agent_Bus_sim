@@ -257,7 +257,7 @@ def save_to_google_sheets(student_name, student_roll, subject, difficulty, score
                    "URL from Deploy -> Web app, not the editor or /dev URL.")
         
     payload = {
-        "student_name": student_name,
+        "student_email": student_email,
         "student_roll": student_roll,
         "subject": subject,
         "difficulty": difficulty,
