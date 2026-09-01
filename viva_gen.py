@@ -64,7 +64,7 @@ from filelock import FileLock, Timeout as FileLockTimeout
 
 st.set_page_config(page_title="GLIM Project Viva Examiner", page_icon="🎓")
 st.title("🎓 GLIM Project Viva Examiner")
-st.caption("Powered by Groq + GPT-OSS 20B — 📝 Text-Based Viva Mode")
+st.caption("Powered by Groq + GPT-OSS 120B — 📝 Text-Based Viva Mode")
 
 # Save the scoresheet in the SAME folder as this script, regardless of where
 # Streamlit is launched from. This makes it easy to find on disk.
@@ -268,31 +268,37 @@ def chat_with_llm(messages, max_retries=5):
     friendly message, plus the real error for whoever is troubleshooting)
     if the problem persists.
 
-    Model: "openai/gpt-oss-20b" is a REASONING model — it spends extra
-    hidden "thinking" tokens on every reply, on top of the growing
-    conversation history and the project text embedded in the system
-    prompt, so it can hit a token-budget-based rate limit within a single
-    viva even with no other students involved. A non-reasoning model with a
-    bigger token budget would help, but which models a given Groq API key
-    can actually reach varies by account/tier (a "llama-3.3-70b-versatile"
-    attempt here 404'd as not accessible on this key even though Groq's own
-    docs list it) — check console.groq.com/docs/models or the Playground
-    while logged into the account this key belongs to before changing this,
-    rather than guessing from outside documentation.
+    Model: "openai/gpt-oss-120b" — confirmed accessible on this account's
+    key (a prior attempt at "llama-3.3-70b-versatile" 404'd as inaccessible,
+    which models a given key can reach varies by account/tier and is only
+    reliably checked via console.groq.com/docs/models or the Playground
+    while logged into the account the key belongs to). Like the 20B model
+    this replaced, it is still a REASONING model that spends extra hidden
+    "thinking" tokens on every reply on top of the growing conversation
+    history and the embedded project text — being a bigger model, its
+    free-tier token-per-minute budget on Groq may be smaller, not larger,
+    than the 20B model's, so this may not by itself reduce "busy"/rate-limit
+    errors (it should read the report and reason about it somewhat more
+    carefully, though, and replies may be a bit slower).
     """
     last_error = None
     for attempt in range(max_retries):
         try:
             response = client.chat.completions.create(
-                model="openai/gpt-oss-20b",
+                model="openai/gpt-oss-120b",
                 messages=messages,
                 max_tokens=1024,
-                # "medium" balances speed with reliably following instructions like
-                # "ask ONE question at a time" — "low" was faster but let the model
-                # bundle multiple questions into a single reply more often. Bump to
-                # "high" for even more careful, deliberate questioning at the cost
-                # of extra latency; drop back to "low" only if replies feel slow.
-                reasoning_effort="medium",
+                # "low" keeps hidden "thinking" tokens to a minimum on every
+                # call — unlike the resent conversation history (which Groq's
+                # automatic prompt caching can discount and exempt from rate
+                # limits on a cache hit), reasoning tokens are generated fresh
+                # every time and never benefit from that, so this is the
+                # biggest lever for cutting real per-call token cost and
+                # rate-limit pressure. Trade-off: "low" was previously found
+                # to let the model bundle multiple questions into a single
+                # reply more often than "medium" did — watch actual vivas for
+                # that, and bump back to "medium" (or "high") if it recurs.
+                reasoning_effort="low",
             )
             return response.choices[0].message.content
         except Exception as e:
