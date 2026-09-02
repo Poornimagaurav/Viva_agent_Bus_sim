@@ -258,20 +258,52 @@ def render_viva_controller(remaining_seconds):
 # instead of everyone sharing one faculty-managed key, so one student's
 # usage can no longer rate-limit or block anyone else's viva.
 #
-# Google renames/retires model IDs faster than this file gets updated, and
-# which exact models a given free-tier key can reach isn't something we can
-# verify from here (the same lesson learned the hard way with a Groq model
-# that 404'd despite being listed in Groq's own docs) — so instead of
-# betting on one hardcoded name, we try each of these in order and stick
-# with the first one that actually works for THAT student's key. If every
-# candidate 404s, check https://aistudio.google.com/ while signed into the
-# affected Google account for a model name it can actually reach, and add
-# it to this list.
+# Google renames/retires model IDs often — an earlier version of this list
+# (gemini-2.5-flash / gemini-2.0-flash / gemini-2.5-flash-lite) went 404 on
+# a real key because Google had moved past that generation entirely. These
+# are simply a fast-path first guess, checked against the live model
+# lineup as of when this was last updated; chat_with_llm() below does NOT
+# depend on this list being right — if every entry here 404s, it asks the
+# API directly (client.models.list()) what THIS key can actually reach and
+# uses that instead, so a future rename can't break the app the same way
+# again. Update this list opportunistically, but it's a convenience, not a
+# requirement.
 GEMINI_MODEL_CANDIDATES = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
 ]
+
+def _discover_gemini_models(client):
+    """Last-resort fallback used only when every GEMINI_MODEL_CANDIDATES
+    entry 404s: asks the Gemini API directly which models THIS key can
+    reach and use for generateContent, instead of us guessing a name from
+    outside documentation that may already be stale. Prefers lighter/
+    cheaper "flash"-family, "lite" models — faster and with more generous
+    free-tier limits — over "pro" or other heavier ones."""
+    try:
+        models = list(client.models.list())
+    except Exception:
+        return []
+    names = []
+    for m in models:
+        actions = getattr(m, "supported_actions", None) or []
+        if actions and "generateContent" not in actions:
+            continue
+        name = (getattr(m, "name", None) or "").split("/")[-1]
+        if name:
+            names.append(name)
+
+    def sort_key(n):
+        n_low = n.lower()
+        return (
+            0 if "flash" in n_low else (1 if "pro" in n_low else 2),
+            0 if "lite" in n_low else 1,
+            len(n),
+        )
+    names.sort(key=sort_key)
+    return names
 
 def _to_gemini_contents(messages):
     """Converts our internal OpenAI-style [{"role", "content"}, ...] history
@@ -305,9 +337,11 @@ def _to_gemini_contents(messages):
 def chat_with_llm(messages, max_retries=5):
     """Calls the Gemini API with the CURRENT STUDENT'S OWN key, retrying
     transient/rate-limit errors with backoff and falling back through
-    GEMINI_MODEL_CANDIDATES on a "model not found" response. Only gives up
-    (with a friendly message, plus the real error for troubleshooting) once
-    every avenue is exhausted.
+    GEMINI_MODEL_CANDIDATES — and, if every one of those 404s, through a
+    live discovery of whatever models this key can actually reach — on a
+    "model not found" response. Only gives up (with a friendly message,
+    plus the real error for troubleshooting) once every avenue is
+    exhausted.
     """
     api_key = (st.session_state.get("gemini_api_key") or "").strip()
     if not api_key:
@@ -321,88 +355,110 @@ def chat_with_llm(messages, max_retries=5):
         max_output_tokens=1024,
         temperature=0.4,
     )
+    last_error = None
+
+    def try_models(model_list):
+        """Tries each model in model_list in turn. Returns ("success", text),
+        ("not_found", None) if every one 404'd, or ("terminal", None) if an
+        error message was already shown to the user (nothing more to try)."""
+        nonlocal last_error
+        for model_name in model_list:
+            for attempt in range(max_retries):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name, contents=contents, config=config,
+                    )
+                    st.session_state.gemini_working_model = model_name
+                    return "success", response.text
+                except Exception as e:
+                    last_error = e
+                    msg = str(e).lower()
+
+                    if any(tok in msg for tok in
+                           ["api key not valid", "api_key_invalid", "permission_denied",
+                            "401", "403"]):
+                        st.error(
+                            "⚠️ Your Gemini API key was rejected. Double-check you pasted "
+                            "it correctly, or get a fresh free key at "
+                            "https://aistudio.google.com/apikey."
+                        )
+                        return "terminal", None
+
+                    if any(tok in msg for tok in ["404", "not found", "does not exist"]):
+                        # This model isn't reachable on this key — try the
+                        # next candidate instead of burning retries here.
+                        break
+
+                    if any(tok in msg for tok in
+                           ["400", "invalid_argument", "invalid argument"]):
+                        # A malformed request (e.g. once, an empty `contents`
+                        # list on the very first call). Retrying won't help —
+                        # the exact same request would just fail the exact
+                        # same way — so say so plainly instead of the
+                        # misleading "temporarily busy" message, which would
+                        # send a student into a pointless retry loop.
+                        st.error(
+                            "⚠️ The examiner AI rejected this request as malformed — "
+                            "this points to a bug in the app rather than something "
+                            "retrying will fix. Please tell your faculty, including "
+                            "the technical details below."
+                        )
+                        with st.expander("Technical details (for troubleshooting)"):
+                            st.code(str(last_error))
+                        return "terminal", None
+
+                    is_transient = any(tok in msg for tok in
+                                        ["429", "resource_exhausted", "rate limit", "quota",
+                                         "timeout", "timed out", "502", "503", "unavailable",
+                                         "connection"])
+                    if is_transient and attempt < max_retries - 1:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                        time.sleep(wait)
+                        continue
+
+                    # A non-transient, non-404 error, or retries exhausted on
+                    # a transient one: give up rather than silently cycling
+                    # every remaining candidate model.
+                    st.error(
+                        "⚠️ The examiner AI is temporarily busy or rate-limited. "
+                        "Please wait a few seconds, then submit your answer "
+                        "again — nothing has been lost."
+                    )
+                    with st.expander("Technical details (for troubleshooting)"):
+                        st.code(str(last_error))
+                    return "terminal", None
+        return "not_found", None
 
     # Once we've found a model THIS key can reach, keep using it for the
     # rest of the viva instead of re-probing every candidate on every call.
-    models_to_try = (
+    first_pass = (
         [st.session_state["gemini_working_model"]]
         if st.session_state.get("gemini_working_model")
         else GEMINI_MODEL_CANDIDATES
     )
+    outcome, text = try_models(first_pass)
+    if outcome == "success":
+        return text
+    if outcome == "terminal":
+        return None
 
-    last_error = None
-    for model_name in models_to_try:
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model=model_name, contents=contents, config=config,
-                )
-                st.session_state.gemini_working_model = model_name
-                return response.text
-            except Exception as e:
-                last_error = e
-                msg = str(e).lower()
-
-                if any(tok in msg for tok in
-                       ["api key not valid", "api_key_invalid", "permission_denied",
-                        "401", "403"]):
-                    st.error(
-                        "⚠️ Your Gemini API key was rejected. Double-check you pasted "
-                        "it correctly, or get a fresh free key at "
-                        "https://aistudio.google.com/apikey."
-                    )
-                    return None
-
-                if any(tok in msg for tok in ["404", "not found", "does not exist"]):
-                    # This model isn't reachable on this key — try the next
-                    # candidate instead of burning retries on a dead end.
-                    break
-
-                if any(tok in msg for tok in
-                       ["400", "invalid_argument", "invalid argument"]):
-                    # A malformed request (e.g. once, an empty `contents`
-                    # list on the very first call). Retrying won't help —
-                    # the exact same request would just fail the exact same
-                    # way — so say so plainly instead of the misleading
-                    # "temporarily busy, try again" message, which would
-                    # send a student into a pointless retry loop.
-                    st.error(
-                        "⚠️ The examiner AI rejected this request as malformed — "
-                        "this points to a bug in the app rather than something "
-                        "retrying will fix. Please tell your faculty, including "
-                        "the technical details below."
-                    )
-                    with st.expander("Technical details (for troubleshooting)"):
-                        st.code(str(last_error))
-                    return None
-
-                is_transient = any(tok in msg for tok in
-                                    ["429", "resource_exhausted", "rate limit", "quota",
-                                     "timeout", "timed out", "502", "503", "unavailable",
-                                     "connection"])
-                if is_transient and attempt < max_retries - 1:
-                    # Exponential backoff with jitter.
-                    wait = (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(wait)
-                    continue
-
-                # A non-transient, non-404 error, or retries exhausted on a
-                # transient one: give up rather than silently cycling every
-                # remaining candidate model.
-                st.error(
-                    "⚠️ The examiner AI is temporarily busy or rate-limited. Please "
-                    "wait a few seconds, then submit your answer again — nothing "
-                    "has been lost."
-                )
-                with st.expander("Technical details (for troubleshooting)"):
-                    st.code(str(last_error))
-                return None
+    # Every hardcoded candidate 404'd — ask the API directly what this key
+    # can actually reach instead of guessing another name from outside.
+    discovered = [m for m in _discover_gemini_models(client) if m not in first_pass]
+    if discovered:
+        outcome, text = try_models(discovered)
+        if outcome == "success":
+            return text
+        if outcome == "terminal":
+            return None
 
     st.error(
-        "⚠️ None of the expected Gemini models "
-        f"({', '.join(GEMINI_MODEL_CANDIDATES)}) are available on your API key. "
-        "Check https://aistudio.google.com/ while signed into the Google account "
-        "the key belongs to, for a model name it can access."
+        "⚠️ No usable Gemini model could be found for your API key — neither "
+        f"the expected ones ({', '.join(GEMINI_MODEL_CANDIDATES)}) nor anything "
+        "discovered by asking the API directly. Check "
+        "https://aistudio.google.com/ while signed into the Google account "
+        "the key belongs to, and confirm the Generative Language API is "
+        "enabled for it."
     )
     with st.expander("Technical details (for troubleshooting)"):
         st.code(str(last_error))
